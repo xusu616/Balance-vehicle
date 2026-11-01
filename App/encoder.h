@@ -26,6 +26,9 @@ int32_t Encoder_GetTotal(MotorId motor);
 /* Return raw 16-bit hardware timer counter (TIM2->CNT or TIM3->CNT). */
 uint16_t Encoder_GetRawCounter(MotorId motor);
 
+/* Convert encoder count delta measured over period_ms into wheel RPM. */
+int32_t Encoder_DeltaToRPM(int16_t delta_counts, uint32_t period_ms);
+
 /* Reset hardware counter and accumulated total for one motor (or both). */
 void Encoder_Reset(MotorId motor);
 void Encoder_ResetAll(void);

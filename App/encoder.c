@@ -44,6 +44,15 @@ uint16_t Encoder_GetRawCounter(MotorId motor)
     return (uint16_t)__HAL_TIM_GET_COUNTER(GetTimer(motor));
 }
 
+int32_t Encoder_DeltaToRPM(int16_t delta_counts, uint32_t period_ms)
+{
+    if (period_ms == 0U) {
+        return 0;
+    }
+    return ((int32_t)delta_counts * 60000L) /
+           ((int32_t)ENCODER_COUNTS_PER_REV * (int32_t)period_ms);
+}
+
 void Encoder_Reset(MotorId motor)
 {
     uint8_t idx = (motor == MOTOR_LEFT) ? 0U : 1U;
