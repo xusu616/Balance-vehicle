@@ -1,8 +1,10 @@
 #include "motor_test.h"
 #include "motor.h"
 #include "encoder.h"
+#include "mpu6050.h"
 #include "tim.h"
 #include "usart.h"
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -11,6 +13,8 @@
 #define BOTH_PULSE_MS       3000U /* b/B (Both wheels): 3s run */
 #define TEST_REST_MS        1000U
 #define HEARTBEAT_MS        1000U
+#define IMU_PERIOD_MS        100U /* 'i' stream rate: 10 Hz */
+#define IMU_CAL_SAMPLES      200U
 
 typedef enum {
     TARGET_LEFT = 0,
@@ -26,11 +30,69 @@ static uint32_t stopped_at;
 static uint32_t last_heartbeat_at;
 static int32_t pulse_start_enc_r;
 static int32_t pulse_start_enc_l;
+static uint8_t imu_stream;
+static uint8_t imu_ready;
+static uint32_t imu_last_ms;
 
 static void UartPrint(const char *msg)
 {
     (void)HAL_UART_Transmit(&huart2, (const uint8_t *)msg,
                             (uint16_t)strlen(msg), 100U);
+}
+
+/* Format a float as fixed point without pulling in newlib float printf. */
+static void FormatFixed(char *out, size_t out_size, float value, unsigned int decimals)
+{
+    long div = 1;
+    long scaled;
+    char sign = '+';
+    unsigned int i;
+
+    for (i = 0U; i < decimals; i++) {
+        div *= 10;
+    }
+    scaled = (long)lroundf(value * (float)div);
+    if (scaled < 0) {
+        sign = '-';
+        scaled = -scaled;
+    }
+    (void)snprintf(out, out_size, "%c%ld.%0*ld", sign,
+                   scaled / div, (int)decimals, scaled % div);
+}
+
+static void PrintImuLine(const MPU6050_Data *d, float angle_deg)
+{
+    static char buf[192];
+    char ang[12], gx[12], gy[12], gz[12], ax[12], ay[12], az[12];
+
+    FormatFixed(ang, sizeof(ang), angle_deg, 2);
+    FormatFixed(gx, sizeof(gx), d->gyro_dps[0], 1);
+    FormatFixed(gy, sizeof(gy), d->gyro_dps[1], 1);
+    FormatFixed(gz, sizeof(gz), d->gyro_dps[2], 1);
+    FormatFixed(ax, sizeof(ax), d->accel_g[0], 3);
+    FormatFixed(ay, sizeof(ay), d->accel_g[1], 3);
+    FormatFixed(az, sizeof(az), d->accel_g[2], 3);
+
+    (void)snprintf(buf, sizeof(buf),
+                   ">> IMU pitch=%s deg | gyro=%s,%s,%s dps | acc=%s,%s,%s g\r\n",
+                   ang, gx, gy, gz, ax, ay, az);
+    UartPrint(buf);
+}
+
+static void PrintImuBias(void)
+{
+    static char buf[128];
+    float bias[3];
+    char bx[12], by[12], bz[12];
+
+    MPU6050_GetGyroBias(bias);
+    FormatFixed(bx, sizeof(bx), bias[0], 2);
+    FormatFixed(by, sizeof(by), bias[1], 2);
+    FormatFixed(bz, sizeof(bz), bias[2], 2);
+    (void)snprintf(buf, sizeof(buf),
+                   ">> Gyro bias: X=%s Y=%s Z=%s dps (send G to redo)\r\n",
+                   bx, by, bz);
+    UartPrint(buf);
 }
 
 static void PrintHelp(void)
@@ -41,6 +103,7 @@ static void PrintHelp(void)
         "Right (BO1/BO2, PA9, PB14/15, EncB PA6/7): r/R = 0.4s +/- | t/T = 5s +/-\r\n"
         "Both  (Left + Right together)            : b/B = 3.0s +/-\r\n"
         "Duty / Control: 1..5 = 10%..50% | x or space = Emergency Stop\r\n"
+        "IMU   (MPU6050 PB6/PB7, idle): g = one sample | i = stream 10Hz | G = gyro cal\r\n"
         "Utils         : c = Clear encoders | d = GPIO/TIM1 state | ? = Help\r\n";
     UartPrint(text);
 }
@@ -157,6 +220,9 @@ void MotorTest_Init(void)
     last_heartbeat_at = stopped_at;
     pulse_start_enc_l = 0;
     pulse_start_enc_r = 0;
+    imu_stream = 0U;
+    imu_ready = 0U;
+    imu_last_ms = stopped_at;
 
     Motor_EmergencyStop();
     (void)Encoder_Init();
@@ -175,6 +241,26 @@ void MotorTest_Init(void)
                        (csr & RCC_CSR_LPWRRSTF) ? " low-power" : "");
         UartPrint(rst);
         RCC->CSR |= RCC_CSR_RMVF;
+    }
+
+    {
+        static char buf[96];
+        uint8_t who = 0U;
+
+        if (MPU6050_Init() == HAL_OK && MPU6050_ReadWhoAmI(&who) == HAL_OK) {
+            (void)snprintf(buf, sizeof(buf),
+                           ">> MPU6050 OK (WHO_AM_I=0x%02X), keep car still while calibrating...\r\n",
+                           (unsigned int)who);
+            UartPrint(buf);
+            if (MPU6050_CalibrateGyro(IMU_CAL_SAMPLES) == HAL_OK) {
+                imu_ready = 1U;
+                PrintImuBias();
+            } else {
+                UartPrint(">> MPU6050 gyro calibration failed (I2C error).\r\n");
+            }
+        } else {
+            UartPrint(">> MPU6050 not found on PB6/PB7. Check VCC/GND/SCL/SDA/AD0.\r\n");
+        }
     }
 }
 
@@ -221,12 +307,26 @@ void MotorTest_Poll(void)
         UartPrint(buf);
     }
 
-    /* 3. Clear UART Overrun Error if multiple bytes arrived while busy */
+    /* Skip blocking I2C reads during motor pulses so the stop check can run. */
+    if (running == 0U && imu_stream != 0U && (uint32_t)(now - imu_last_ms) >= IMU_PERIOD_MS) {
+        uint32_t dt_ms = (uint32_t)(now - imu_last_ms);
+        MPU6050_Data d;
+
+        imu_last_ms = now;
+        if (MPU6050_UpdateAngle((float)dt_ms / 1000.0f, &d) == HAL_OK) {
+            PrintImuLine(&d, MPU6050_GetAngleDeg());
+        } else {
+            imu_stream = 0U;
+            UartPrint(">> IMU read failed; stream stopped. Check PB6/PB7.\r\n");
+        }
+    }
+
+    /* 4. Clear UART Overrun Error if multiple bytes arrived while busy */
     if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE) != RESET) {
         __HAL_UART_CLEAR_OREFLAG(&huart2);
     }
 
-    /* 4. Non-blocking 1-byte UART receive */
+    /* 5. Non-blocking 1-byte UART receive */
     if (HAL_UART_Receive(&huart2, &command, 1U, 0U) != HAL_OK) {
         return;
     }
@@ -249,8 +349,50 @@ void MotorTest_Poll(void)
         UartPrint(">> Busy running, ignored (press x to stop).\r\n");
         return;
     }
+    if (command == 'g') {
+        uint32_t dt_ms = (uint32_t)(now - imu_last_ms);
+        MPU6050_Data d;
+
+        if (imu_ready == 0U) {
+            UartPrint(">> MPU6050 not ready. Check PB6/PB7 wiring.\r\n");
+            return;
+        }
+        imu_last_ms = now;
+        if (MPU6050_UpdateAngle(imu_stream != 0U ? (float)dt_ms / 1000.0f : 0.0f, &d) == HAL_OK) {
+            PrintImuLine(&d, MPU6050_GetAngleDeg());
+        } else {
+            UartPrint(">> MPU6050 read failed (I2C). Check PB6/PB7 and pull-ups.\r\n");
+        }
+        return;
+    }
+    if (command == 'i' || command == 'I') {
+        if (imu_ready == 0U) {
+            UartPrint(">> MPU6050 not ready. Check PB6/PB7 wiring.\r\n");
+            return;
+        }
+        imu_stream = (imu_stream == 0U) ? 1U : 0U;
+        imu_last_ms = now;
+        MPU6050_ResetAngle();
+        UartPrint((imu_stream != 0U) ? ">> IMU stream ON (10 Hz)\r\n"
+                                     : ">> IMU stream OFF\r\n");
+        return;
+    }
     if (command == '?') {
         PrintHelp();
+        return;
+    }
+    if (command == 'G') {
+        if (imu_ready == 0U) {
+            UartPrint(">> MPU6050 not ready. Check PB6/PB7 wiring.\r\n");
+            return;
+        }
+        UartPrint(">> Keep car still: calibrating gyro...\r\n");
+        if (MPU6050_CalibrateGyro(IMU_CAL_SAMPLES) == HAL_OK) {
+            PrintImuBias();
+        } else {
+            UartPrint(">> Gyro calibration failed (I2C).\r\n");
+        }
+        imu_last_ms = HAL_GetTick();
         return;
     }
     if (command == 'c' || command == 'C') {

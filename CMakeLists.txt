@@ -46,6 +46,7 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     App/motor.c
     App/encoder.c
+    App/mpu6050.c
     App/motor_test.c
 )
 
