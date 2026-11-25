@@ -35,6 +35,9 @@
 #ifndef MPU6050_PITCH_AXIS
 #define MPU6050_PITCH_AXIS          MPU6050_PITCH_AXIS_Y
 #endif
+#if MPU6050_PITCH_AXIS != MPU6050_PITCH_AXIS_X && MPU6050_PITCH_AXIS != MPU6050_PITCH_AXIS_Y
+#error "MPU6050_PITCH_AXIS must be X or Y"
+#endif
 #ifndef MPU6050_PITCH_RATE_SIGN
 #define MPU6050_PITCH_RATE_SIGN     (-1.0f)
 #endif
@@ -77,6 +80,8 @@ HAL_StatusTypeDef MPU6050_UpdateAngle(float dt_s, MPU6050_Data *out_data);
 
 /* Pitch in degrees. Check nose-up direction after mounting the module. */
 float MPU6050_GetAngleDeg(void);
+/* Pitch rate in the same direction as increasing pitch angle. */
+float MPU6050_GetPitchRateDps(const MPU6050_Data *data);
 void MPU6050_ResetAngle(void);
 
 /* Re-init the STM32 I2C1 peripheral and probe; no SCL bus-clear pulses. */

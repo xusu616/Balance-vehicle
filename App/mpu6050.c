@@ -170,7 +170,6 @@ void MPU6050_GetGyroBias(float bias_dps[3])
 HAL_StatusTypeDef MPU6050_UpdateAngle(float dt_s, MPU6050_Data *out_data)
 {
     MPU6050_Data data;
-    float rate_dps;
     float forward_g;
     float accel_angle;
 
@@ -180,10 +179,8 @@ HAL_StatusTypeDef MPU6050_UpdateAngle(float dt_s, MPU6050_Data *out_data)
     }
 
 #if MPU6050_PITCH_AXIS == MPU6050_PITCH_AXIS_Y
-    rate_dps = data.gyro_dps[1];
     forward_g = -data.accel_g[0]; /* Positive Y rotation tilts +Z toward -X in sensor coordinates. */
 #else
-    rate_dps = data.gyro_dps[0];
     forward_g = data.accel_g[1];
 #endif
     accel_angle = MPU6050_PITCH_ACCEL_SIGN *
@@ -195,7 +192,7 @@ HAL_StatusTypeDef MPU6050_UpdateAngle(float dt_s, MPU6050_Data *out_data)
     } else {
         const float alpha = MPU6050_FILTER_TAU_S / (MPU6050_FILTER_TAU_S + dt_s);
         pitch_deg = alpha *
-                    (pitch_deg + MPU6050_PITCH_RATE_SIGN * rate_dps * dt_s) +
+                    (pitch_deg + MPU6050_GetPitchRateDps(&data) * dt_s) +
                     (1.0f - alpha) * accel_angle;
     }
 
@@ -208,6 +205,11 @@ HAL_StatusTypeDef MPU6050_UpdateAngle(float dt_s, MPU6050_Data *out_data)
 float MPU6050_GetAngleDeg(void)
 {
     return pitch_deg;
+}
+
+float MPU6050_GetPitchRateDps(const MPU6050_Data *data)
+{
+    return MPU6050_PITCH_RATE_SIGN * data->gyro_dps[MPU6050_PITCH_AXIS];
 }
 
 void MPU6050_ResetAngle(void)

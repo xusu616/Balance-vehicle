@@ -2,6 +2,7 @@
 #include "motor.h"
 #include "encoder.h"
 #include "mpu6050.h"
+#include "balance.h"
 #include "tim.h"
 #include "usart.h"
 #include <math.h>
@@ -15,6 +16,7 @@
 #define HEARTBEAT_MS        1000U
 #define IMU_PERIOD_MS        100U /* 'i' stream rate: 10 Hz */
 #define IMU_CAL_SAMPLES      200U
+#define PD_REPORT_PERIOD_MS  100U
 
 typedef enum {
     TARGET_LEFT = 0,
@@ -33,6 +35,8 @@ static int32_t pulse_start_enc_l;
 static uint8_t imu_stream;
 static uint8_t imu_ready;
 static uint32_t imu_last_ms;
+static uint8_t balance_preview;
+static uint32_t balance_report_ms;
 
 static void UartPrint(const char *msg)
 {
@@ -58,6 +62,92 @@ static void FormatFixed(char *out, size_t out_size, float value, unsigned int de
     }
     (void)snprintf(out, out_size, "%c%ld.%0*ld", sign,
                    scaled / div, (int)decimals, scaled % div);
+}
+
+static uint8_t ReadCommand(uint8_t *command)
+{
+    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE) != RESET) {
+        __HAL_UART_CLEAR_OREFLAG(&huart2);
+    }
+    return HAL_UART_Receive(&huart2, command, 1U, 0U) == HAL_OK &&
+           *command != '\r' && *command != '\n';
+}
+
+static void StartBalancePreview(void)
+{
+    BalanceSample sample;
+    char angle[12];
+    char buf[72];
+
+    if (imu_ready == 0U) {
+        UartPrint(">> MPU6050 not ready.\r\n");
+        return;
+    }
+
+    Motor_EmergencyStop();
+    imu_stream = 0U;
+    const BalanceStatus status = Balance_StartPreview(&sample);
+    if (status == BALANCE_NOT_UPRIGHT) {
+        UartPrint(">> PD: hold the car upright and still, then send p.\r\n");
+        return;
+    }
+    if (status != BALANCE_SAMPLE_READY) {
+        UartPrint(">> PD: MPU6050 read failed.\r\n");
+        return;
+    }
+
+    balance_preview = 1U;
+    balance_report_ms = HAL_GetTick();
+    FormatFixed(angle, sizeof(angle), sample.target_deg, 2);
+    (void)snprintf(buf, sizeof(buf), ">> PD preview ON, target=%s deg, STBY=0. x to exit.\r\n", angle);
+    UartPrint(buf);
+}
+
+static void StopBalancePreview(const char *message)
+{
+    Motor_EmergencyStop();
+    balance_preview = 0U;
+    stopped_at = HAL_GetTick();
+    UartPrint(message);
+}
+
+static void PollBalancePreview(void)
+{
+    uint8_t command;
+    BalanceSample sample;
+    char buf[80], pitch[12], rate[12], error[12];
+
+    if (ReadCommand(&command) != 0U && (command == 'x' || command == ' ')) {
+        StopBalancePreview(">> PD preview OFF.\r\n");
+        return;
+    }
+
+    switch (Balance_PollPreview(&sample)) {
+    case BALANCE_WAITING:
+        return;
+    case BALANCE_SAMPLE_READY:
+        break;
+    case BALANCE_SAMPLE_LATE:
+        StopBalancePreview(">> PD preview OFF: missed sample deadline.\r\n");
+        return;
+    case BALANCE_TILT_LIMIT:
+        StopBalancePreview(">> PD preview OFF: tilt limit reached.\r\n");
+        return;
+    default:
+        StopBalancePreview(">> PD preview OFF: MPU6050 read failed.\r\n");
+        return;
+    }
+
+    const uint32_t now = HAL_GetTick();
+    if ((uint32_t)(now - balance_report_ms) >= PD_REPORT_PERIOD_MS) {
+        balance_report_ms = now;
+        FormatFixed(pitch, sizeof(pitch), sample.pitch_deg, 2);
+        FormatFixed(error, sizeof(error), sample.target_deg - sample.pitch_deg, 2);
+        FormatFixed(rate, sizeof(rate), sample.rate_dps, 1);
+        (void)snprintf(buf, sizeof(buf), "PD pitch=%s err=%s rate=%s u=%+d/1000\r\n",
+                       pitch, error, rate, (int)sample.forward_permille);
+        UartPrint(buf);
+    }
 }
 
 static void PrintImuLine(const MPU6050_Data *d, float angle_deg)
@@ -104,6 +194,7 @@ static void PrintHelp(void)
         "Both  (Left + Right together)            : b/B = 3.0s +/-\r\n"
         "Duty / Control: 1..5 = 10%..50% | x or space = Emergency Stop\r\n"
         "IMU   (MPU6050 PB6/PB7, idle): g = one sample | i = stream 10Hz | G = gyro cal\r\n"
+        "PD    : p = preview, hold upright | x or space = exit\r\n"
         "Utils         : c = Clear encoders | d = GPIO/TIM1 state | ? = Help\r\n";
     UartPrint(text);
 }
@@ -223,6 +314,7 @@ void MotorTest_Init(void)
     imu_stream = 0U;
     imu_ready = 0U;
     imu_last_ms = stopped_at;
+    balance_preview = 0U;
 
     Motor_EmergencyStop();
     (void)Encoder_Init();
@@ -271,6 +363,11 @@ void MotorTest_Poll(void)
     int16_t duty;
     uint32_t now = HAL_GetTick();
     uint32_t duration_ms = TEST_PULSE_MS;
+
+    if (balance_preview != 0U) {
+        PollBalancePreview();
+        return;
+    }
 
     /* 1. Stop pulse when deadline expires and report both encoder deltas */
     if (running != 0U && (uint32_t)(now - started_at) >= active_pulse_ms) {
@@ -321,16 +418,7 @@ void MotorTest_Poll(void)
         }
     }
 
-    /* 4. Clear UART Overrun Error if multiple bytes arrived while busy */
-    if (__HAL_UART_GET_FLAG(&huart2, UART_FLAG_ORE) != RESET) {
-        __HAL_UART_CLEAR_OREFLAG(&huart2);
-    }
-
-    /* 5. Non-blocking 1-byte UART receive */
-    if (HAL_UART_Receive(&huart2, &command, 1U, 0U) != HAL_OK) {
-        return;
-    }
-    if (command == '\r' || command == '\n') {
+    if (ReadCommand(&command) == 0U) {
         return;
     }
 
@@ -347,6 +435,10 @@ void MotorTest_Poll(void)
     }
     if (running != 0U) {
         UartPrint(">> Busy running, ignored (press x to stop).\r\n");
+        return;
+    }
+    if (command == 'p') {
+        StartBalancePreview();
         return;
     }
     if (command == 'g') {

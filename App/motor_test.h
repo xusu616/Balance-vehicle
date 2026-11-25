@@ -1,7 +1,7 @@
 #ifndef APP_MOTOR_TEST_H
 #define APP_MOTOR_TEST_H
 
-/* Stage 1 manual UART test. No encoder, PID or automatic motion sequence. */
+/* UART interface for motor, encoder, IMU and angle PD bench tests. */
 void MotorTest_Init(void);
 void MotorTest_Poll(void);
 
